@@ -5,15 +5,16 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal, Qt, QUrl
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QShortcut
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow,
-    QMessageBox, QPushButton, QProgressBar, QSplitter, QTableWidget,
-    QTableWidgetItem, QToolBar, QVBoxLayout, QWidget, QDockWidget,
+    QMessageBox, QPushButton, QProgressBar, QTabWidget, QTableWidget,
+    QTableWidgetItem, QToolBar, QVBoxLayout, QWidget, QDockWidget, QListWidget,
+    QListWidgetItem,
 )
 
-from app.analysis import _create_demo_project, analyze_audio
+from app.analysis import _create_demo_project, analyze_audio, regenerate_measure
 from app.midi_service import build_preview_wav, export_midi
 from app.models import NoteEvent, SongProject
 from app.ui.piano_roll import PianoRoll
@@ -49,12 +50,17 @@ class MainWindow(QMainWindow):
         self.audio_output = QAudioOutput(self)
         self.player.setAudioOutput(self.audio_output)
         self.audio_output.setVolume(0.42)
+        self._tool_mode = "select"
+        self._active_track_name = "主旋律"
+        self.selected_note: NoteEvent | None = None
+        self.selected_measure = 0
         self.setWindowTitle("Ruki's Music Transcriber · AI 快速扒谱")
         self.resize(1360, 840)
         self.setStyleSheet(APP_STYLESHEET)
         self._build_toolbar()
         self._build_workspace()
         self._build_docks()
+        self._build_shortcuts()
         self.statusBar().showMessage("准备就绪：导入一首音频，开始你的扒谱练习。")
 
     def _build_toolbar(self) -> None:
@@ -66,64 +72,92 @@ class MainWindow(QMainWindow):
             action = QAction(label, self)
             action.triggered.connect(handler)
             toolbar.addAction(action)
+        toolbar.addSeparator()
+        self.select_action = QAction("选择工具", self, checkable=True)
+        self.paint_action = QAction("画笔工具", self, checkable=True)
+        self.select_action.setChecked(True)
+        self.select_action.triggered.connect(lambda: self.set_tool_mode("select"))
+        self.paint_action.triggered.connect(lambda: self.set_tool_mode("pencil"))
+        action_group = QActionGroup(self)
+        action_group.setExclusive(True)
+        action_group.addAction(self.select_action)
+        action_group.addAction(self.paint_action)
+        toolbar.addAction(self.select_action)
+        toolbar.addAction(self.paint_action)
 
     def _build_workspace(self) -> None:
-        self.stack = QSplitter(Qt.Orientation.Vertical)
+        self.tabs = QTabWidget()
+
+        self.edit_tab = QWidget()
+        edit_layout = QVBoxLayout(self.edit_tab)
         self.welcome = self._create_welcome()
+        edit_layout.addWidget(self.welcome)
         self.roll = PianoRoll()
         self.roll.note_selected.connect(self.show_note_details)
         self.roll.note_added.connect(lambda note: self.statusBar().showMessage(f"已添加 {self._note_name(note.pitch)}"))
         self.roll.note_deleted.connect(lambda note: self.statusBar().showMessage("已删除音符"))
-        self.stack.addWidget(self.welcome)
-        self.stack.addWidget(self.roll)
-        self.stack.setSizes([700, 1])
-        self.setCentralWidget(self.stack)
+        self.roll.set_active_track(self._active_track_name)
+        self.roll.set_edit_mode(self._tool_mode)
+        edit_layout.addWidget(self.roll)
+        self.tabs.addTab(self.edit_tab, "编辑")
+
+        self.analysis_tab = QWidget()
+        analysis_layout = QVBoxLayout(self.analysis_tab)
+        analysis_layout.addWidget(QLabel("分析结果与小节置信度"))
+        self.analysis_tab.setLayout(analysis_layout)
+        self.tabs.addTab(self.analysis_tab, "分析")
+
+        self.output_tab = QWidget()
+        output_layout = QVBoxLayout(self.output_tab)
+        output_layout.setSpacing(14)
+        output_layout.addWidget(QLabel("输出与实时试听"))
+        output_controls = QHBoxLayout()
+        preview_button = QPushButton("试听当前项目")
+        preview_button.clicked.connect(self.preview_project)
+        stop_button = QPushButton("停止播放")
+        stop_button.clicked.connect(self.player.stop)
+        output_controls.addWidget(preview_button)
+        output_controls.addWidget(stop_button)
+        output_layout.addLayout(output_controls)
+        export_button = QPushButton("导出当前 MIDI")
+        export_button.clicked.connect(self.export_current_midi)
+        output_layout.addWidget(export_button)
+        output_layout.addStretch(1)
+        self.tabs.addTab(self.output_tab, "输出")
+
+        self.setCentralWidget(self.tabs)
 
     def _create_welcome(self) -> QWidget:
-        root = QWidget()
-        layout = QVBoxLayout(root)
-        layout.setContentsMargins(70, 70, 70, 70)
-        layout.setSpacing(18)
-        title = QLabel("把每一首喜欢的歌，变成你的编曲课堂")
-        title.setObjectName("titleLabel")
-        subtitle = QLabel("导入音频后，AI 将识别速度、调性、主旋律与节奏；所有结果都可以在钢琴卷帘中修改。")
-        subtitle.setObjectName("subtitleLabel")
-        subtitle.setWordWrap(True)
+        welcome_widget = QWidget()
+        layout = QVBoxLayout(welcome_widget)
+        layout.addWidget(QLabel("欢迎使用 Ruki's Music Transcriber"))
+        layout.addWidget(QLabel("导入音频文件，使用 AI 进行自动扒谱，或打开示例工程开始编辑。"))
         layout.addStretch(1)
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
-        buttons = QHBoxLayout()
-        import_button = QPushButton("导入音乐开始扒谱")
-        import_button.setObjectName("primaryButton")
-        import_button.clicked.connect(self.import_audio)
-        demo_button = QPushButton("先看看示例工程")
-        demo_button.clicked.connect(self.open_demo)
-        buttons.addWidget(import_button)
-        buttons.addWidget(demo_button)
-        buttons.addStretch(1)
-        layout.addLayout(buttons)
-        cards = QHBoxLayout()
-        for heading, description in [("01 识别", "BPM、调性、节拍与主旋律"), ("02 编辑", "双击添加音符，删除错误结果"), ("03 输出", "导出 MIDI，带入任意编曲软件")]:
-            card = QFrame()
-            card.setObjectName("card")
-            card_layout = QVBoxLayout(card)
-            card_layout.addWidget(QLabel(heading))
-            detail = QLabel(description)
-            detail.setObjectName("subtitleLabel")
-            detail.setWordWrap(True)
-            card_layout.addWidget(detail)
-            cards.addWidget(card)
-        layout.addLayout(cards)
-        layout.addStretch(2)
-        return root
+        return welcome_widget
 
     def _build_docks(self) -> None:
-        self.track_table = QTableWidget(0, 3)
-        self.track_table.setHorizontalHeaderLabels(["声部", "音符", "状态"])
-        self.track_table.horizontalHeader().setStretchLastSection(True)
-        track_dock = QDockWidget("声部轨道", self)
-        track_dock.setWidget(self.track_table)
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, track_dock)
+        track_selection = QWidget()
+        track_layout = QVBoxLayout(track_selection)
+        track_layout.addWidget(QLabel("当前画笔轨道"))
+        self.track_list = QListWidget()
+        self.track_list.currentItemChanged.connect(self._on_track_list_changed)
+        self.track_list.setFixedWidth(220)
+        track_layout.addWidget(self.track_list)
+        tool_label = QLabel("工具模式")
+        track_layout.addWidget(tool_label)
+        self.select_tool_button = QPushButton("选择")
+        self.paint_tool_button = QPushButton("画笔")
+        self.select_tool_button.setCheckable(True)
+        self.paint_tool_button.setCheckable(True)
+        self.select_tool_button.clicked.connect(lambda: self.set_tool_mode("select"))
+        self.paint_tool_button.clicked.connect(lambda: self.set_tool_mode("pencil"))
+        self.select_tool_button.setChecked(True)
+        track_layout.addWidget(self.select_tool_button)
+        track_layout.addWidget(self.paint_tool_button)
+        track_layout.addStretch(1)
+        left_dock = QDockWidget("工具与轨道", self)
+        left_dock.setWidget(track_selection)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, left_dock)
 
         inspector = QWidget()
         inspector_layout = QVBoxLayout(inspector)
@@ -132,6 +166,18 @@ class MainWindow(QMainWindow):
         self.metrics.verticalHeader().setVisible(False)
         self.metrics.horizontalHeader().setStretchLastSection(True)
         inspector_layout.addWidget(self.metrics)
+
+        inspector_layout.addWidget(QLabel("每小节最高置信度"))
+        self.measure_table = QTableWidget(0, 3)
+        self.measure_table.setHorizontalHeaderLabels(["小节", "置信度", "音符数"])
+        self.measure_table.verticalHeader().setVisible(False)
+        self.measure_table.horizontalHeader().setStretchLastSection(True)
+        self.measure_table.itemSelectionChanged.connect(self._on_measure_selected)
+        inspector_layout.addWidget(self.measure_table)
+        self.regenerate_button = QPushButton("重新生成选中小节")
+        self.regenerate_button.clicked.connect(self.regenerate_selected_measure)
+        inspector_layout.addWidget(self.regenerate_button)
+
         inspector_layout.addWidget(QLabel("进阶：相似旋律替换"))
         self.candidate_label = QLabel("选中一个音符后，将显示相近候选。")
         self.candidate_label.setWordWrap(True)
@@ -140,9 +186,17 @@ class MainWindow(QMainWindow):
         replace_button.clicked.connect(self.replace_selected_note)
         inspector_layout.addWidget(replace_button)
         inspector_layout.addStretch(1)
+
         info_dock = QDockWidget("分析与编辑", self)
         info_dock.setWidget(inspector)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, info_dock)
+
+    def _build_shortcuts(self) -> None:
+        QShortcut(QKeySequence("Ctrl+I"), self, self.import_audio)
+        QShortcut(QKeySequence("Ctrl+P"), self, self.preview_project)
+        QShortcut(QKeySequence("Ctrl+E"), self, self.export_current_midi)
+        QShortcut(QKeySequence("1"), self, lambda: self.set_tool_mode("select"))
+        QShortcut(QKeySequence("2"), self, lambda: self.set_tool_mode("pencil"))
 
     def import_audio(self) -> None:
         file_name, _ = QFileDialog.getOpenFileName(self, "选择音频文件", "", "音频文件 (*.wav *.mp3 *.flac *.m4a *.ogg)")
@@ -196,18 +250,66 @@ class MainWindow(QMainWindow):
 
     def load_project(self, project: SongProject) -> None:
         self.project = project
+        self.project.update_measure_metadata()
         self.roll.set_project(project)
-        self.stack.setSizes([1, 700])
+        self.roll.set_active_track(self._active_track_name)
+        self.roll.set_edit_mode(self._tool_mode)
+        self.tabs.setCurrentIndex(0)
         self.setWindowTitle(f"{project.title} · Ruki's Music Transcriber")
         self.metrics.setRowCount(4)
-        for row, (name, value) in enumerate([( "调性", project.key), ("速度", f"{project.bpm} BPM"), ("拍号", project.time_signature), ("时长", f"{project.duration:.1f} 秒")]):
+        for row, (name, value) in enumerate([
+            ("调性", project.key), ("速度", f"{project.bpm} BPM"), ("拍号", project.time_signature), ("时长", f"{project.duration:.1f} 秒")]):
             self.metrics.setItem(row, 0, QTableWidgetItem(name))
             self.metrics.setItem(row, 1, QTableWidgetItem(value))
-        self.track_table.setRowCount(len(project.tracks))
-        for row, track in enumerate(project.tracks):
-            self.track_table.setItem(row, 0, QTableWidgetItem(track.name))
-            self.track_table.setItem(row, 1, QTableWidgetItem(str(len(track.notes))))
-            self.track_table.setItem(row, 2, QTableWidgetItem("已识别"))
+        self._populate_track_list()
+        self._populate_measure_list()
+
+    def _populate_track_list(self) -> None:
+        self.track_list.clear()
+        if not self.project:
+            return
+        for track in self.project.tracks:
+            item = QListWidgetItem(track.name)
+            self.track_list.addItem(item)
+            if track.name == self._active_track_name:
+                self.track_list.setCurrentItem(item)
+        if self.track_list.currentRow() < 0 and self.track_list.count() > 0:
+            self.track_list.setCurrentRow(0)
+
+    def _populate_measure_list(self) -> None:
+        if not self.project:
+            return
+        self.project.update_measure_metadata()
+        self.measure_table.setRowCount(len(self.project.measures))
+        for row, measure in enumerate(self.project.measures):
+            self.measure_table.setItem(row, 0, QTableWidgetItem(str(measure["index"] + 1)))
+            self.measure_table.setItem(row, 1, QTableWidgetItem(f"{measure['confidence']:.2f}"))
+            self.measure_table.setItem(row, 2, QTableWidgetItem(str(measure["notes"])))
+        if self.measure_table.rowCount() > 0:
+            self.measure_table.selectRow(0)
+
+    def set_tool_mode(self, mode: str) -> None:
+        self._tool_mode = mode
+        self.roll.set_edit_mode(mode)
+        if hasattr(self, "select_action"):
+            self.select_action.setChecked(mode == "select")
+            self.paint_action.setChecked(mode == "pencil")
+        if hasattr(self, "select_tool_button"):
+            self.select_tool_button.setChecked(mode == "select")
+            self.paint_tool_button.setChecked(mode == "pencil")
+        self.statusBar().showMessage(f"已切换到 {'画笔' if mode == 'pencil' else '选择'} 工具。")
+
+    def _on_track_list_changed(self) -> None:
+        current = self.track_list.currentItem()
+        if current:
+            self._active_track_name = current.text()
+            self.roll.set_active_track(self._active_track_name)
+            self.statusBar().showMessage(f"当前画笔轨道：{self._active_track_name}")
+
+    def _on_measure_selected(self) -> None:
+        self.selected_measure = self.measure_table.currentRow()
+        if self.selected_measure >= 0:
+            self.statusBar().showMessage(f"选中小节：{self.selected_measure + 1}，置信度 {self.project.measure_confidence(self.selected_measure):.2f}" if self.project else "")
 
     def show_note_details(self, note: NoteEvent) -> None:
         self.selected_note = note
@@ -216,21 +318,36 @@ class MainWindow(QMainWindow):
         self.candidate_label.setText(f"当前：{self._note_name(note.pitch)}\n推荐相似走向：{labels}\n点击替换会采用第一项。")
 
     def replace_selected_note(self) -> None:
-        if not hasattr(self, "selected_note") or not self.project:
+        if not self.selected_note or not self.project:
             self.statusBar().showMessage("请先在钢琴卷帘中选中一个音符。")
             return
         self.selected_note.pitch = max(0, min(127, self.selected_note.pitch - 2))
         self.roll.set_project(self.project)
         self.statusBar().showMessage("已应用最高置信度的相似旋律候选。")
 
+    def regenerate_selected_measure(self) -> None:
+        if self.project is None:
+            self.statusBar().showMessage("请先加载一个工程。")
+            return
+        if self.selected_measure < 0 or self.selected_measure >= len(self.project.measures):
+            self.statusBar().showMessage("请先在小节列表中选择一个小节。")
+            return
+        regenerate_measure(self.project, self.selected_measure)
+        self.project.update_measure_metadata()
+        self.roll.set_project(self.project)
+        self._populate_measure_list()
+        self.statusBar().showMessage(f"已重新生成第 {self.selected_measure + 1} 小节。")
+
     def export_current_midi(self) -> None:
         if not self.project:
             self.statusBar().showMessage("请先导入音频或打开示例工程。")
             return
+        self.project.update_measure_metadata()
         default_name = f"{self.project.title}.mid"
         file_name, _ = QFileDialog.getSaveFileName(self, "导出 MIDI", default_name, "MIDI 文件 (*.mid)")
         if file_name:
-            export_midi(self.project, Path(file_name))
+            notes = self.project.export_notes()
+            export_midi(self.project, Path(file_name), notes)
             self.statusBar().showMessage(f"MIDI 已导出：{Path(file_name).name}", 6000)
 
     def preview_project(self) -> None:
