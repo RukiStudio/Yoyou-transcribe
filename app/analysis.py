@@ -1,8 +1,7 @@
-"""Audio feature extraction and a lightweight transcription baseline.
+"""Audio feature extraction and a transcription workflow optimized for noisy MP3 sources.
 
-This module deliberately separates the user interface from machine-learning work.
-The baseline works offline with librosa and leverages harmonic/percussive
-separation, stronger pitch selection, and per-measure confidence tracking.
+This module uses optional stem separation, spectral cleaning, and higher-precision
+pitch tracking to improve transcription accuracy for melody, bass, harmony, and drums.
 """
 
 from __future__ import annotations
@@ -119,7 +118,7 @@ def _extract_pitched_line(
 def _extract_drums(y: np.ndarray, sr: int, bpm: float) -> list[NoteEvent]:
     import librosa
 
-    onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, aggregate=np.median)
     onset_times = librosa.onset.onset_detect(onset_envelope=onset_env, sr=sr, units="time", backtrack=False)
     step = 60.0 / bpm / 4
     strength_profile = librosa.util.normalize(onset_env, norm=2) if onset_env.size else np.array([])
@@ -172,47 +171,148 @@ def _slice_audio_segment(audio: np.ndarray, sr: int, start: float, duration: flo
     return audio[start_sample:end_sample]
 
 
-def regenerate_measure(project: SongProject, measure_idx: int, beats_per_measure: int = 4) -> None:
-    if project.audio_path is None:
-        return
+def _load_audio(path: Path, sr: int = 22050) -> tuple[np.ndarray, int]:
     import librosa
 
-    audio, sr = librosa.load(project.audio_path, sr=22050, mono=True)
-    measure_length = beats_per_measure * 60.0 / project.bpm
-    start_time = measure_idx * measure_length
-    segment = _slice_audio_segment(audio, sr, start_time, measure_length)
-    if segment.size == 0:
-        return
+    audio, sample_rate = librosa.load(path, sr=sr, mono=True)
+    if audio.size == 0:
+        raise ValueError("无法加载音频：文件为空或格式不受支持。")
+    return librosa.util.normalize(audio), sample_rate
 
-    harmonic, percussive = librosa.effects.hpss(segment)
-    melody = _extract_pitched_line(
-        harmonic,
-        sr,
-        project.bpm,
-        "主旋律",
-        fmin="C3",
-        fmax="C7",
-        threshold_ratio=0.16,
-        offset=start_time,
+
+def _bandpass_filter(audio: np.ndarray, sr: int, low: float, high: float, order: int = 4) -> np.ndarray:
+    try:
+        from scipy.signal import butter, filtfilt
+    except ImportError:
+        return audio
+    nyquist = sr / 2.0
+    low_cut = max(1.0, low / nyquist)
+    high_cut = min(0.999, high / nyquist)
+    b, a = butter(order, [low_cut, high_cut], btype="band")
+    return filtfilt(b, a, audio)
+
+
+def _lowpass_filter(audio: np.ndarray, sr: int, cutoff: float, order: int = 4) -> np.ndarray:
+    try:
+        from scipy.signal import butter, filtfilt
+    except ImportError:
+        return audio
+    nyquist = sr / 2.0
+    b, a = butter(order, cutoff / nyquist, btype="low")
+    return filtfilt(b, a, audio)
+
+
+def _spectral_denoise(audio: np.ndarray, sr: int) -> np.ndarray:
+    try:
+        import noisereduce as nr
+
+        noise_clip = audio[: min(len(audio), sr // 2)]
+        return nr.reduce_noise(y=audio, sr=sr, y_noise=noise_clip, prop_decrease=0.85)
+    except Exception:
+        import librosa
+
+        stft = librosa.stft(audio, n_fft=2048, hop_length=512)
+        magnitude, phase = np.abs(stft), np.angle(stft)
+        threshold = np.median(magnitude) * 1.4
+        mask = magnitude >= threshold
+        clean_mag = magnitude * mask
+        return librosa.istft(clean_mag * np.exp(1j * phase), hop_length=512, length=len(audio))
+
+
+def _separate_stems(audio: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    try:
+        from spleeter.separator import Separator
+
+        splitter = Separator("spleeter:4stems")
+        stereo = np.vstack((audio, audio)).T
+        prediction = splitter.separate(stereo)
+        melody = librosa.to_mono(prediction["vocals"].T)
+        bass = librosa.to_mono(prediction["bass"].T)
+        drums = librosa.to_mono(prediction["drums"].T)
+        accompaniment = librosa.to_mono(prediction["accompaniment"].T)
+        harmony = accompaniment - bass
+        return melody, bass, drums, harmony
+    except Exception:
+        import librosa
+
+        harmonic, percussive = librosa.effects.hpss(audio, margin=4.0)
+        bass = _lowpass_filter(harmonic, sr, 250)
+        melody = _bandpass_filter(harmonic, sr, 120, 2400)
+        harmony = harmonic - bass
+        drums = percussive
+        return melody, bass, drums, harmony
+
+
+def _extract_notes_from_f0(
+    y: np.ndarray,
+    sr: int,
+    bpm: float,
+    instrument: str,
+    fmin: str,
+    fmax: str,
+    threshold_ratio: float = 0.15,
+    min_duration: float | None = None,
+    prefer_low: bool = False,
+    offset: float = 0.0,
+) -> list[NoteEvent]:
+    import librosa
+
+    f0, voiced_flag, voiced_probs = librosa.pyin(
+        y,
+        fmin=librosa.note_to_hz(fmin),
+        fmax=librosa.note_to_hz(fmax),
+        sr=sr,
+        frame_length=2048,
+        hop_length=256,
+        threshold=0.1,
     )
+    times = librosa.times_like(f0, sr=sr, hop_length=256)
+    step = 60.0 / bpm / 4
+    min_duration = min_duration or step
 
-    melody_track = next((track for track in project.tracks if track.name == "主旋律"), None)
-    if melody_track is None:
-        melody_track = Track("主旋律", 0, "#7C5CFC", [])
-        project.tracks.insert(0, melody_track)
+    notes: list[NoteEvent] = []
+    active_pitch = None
+    active_start = 0.0
+    active_confidence = 0.0
+    for index, (timestamp, pitch_hz, voiced) in enumerate(zip(times, f0, voiced_flag)):
+        pitch = None
+        if voiced and pitch_hz is not None and not np.isnan(pitch_hz):
+            candidate = int(round(librosa.hz_to_midi(pitch_hz)))
+            if 28 <= candidate <= 96:
+                if prefer_low and candidate > 52:
+                    candidate = None
+                elif voiced_probs is not None:
+                    prob = float(voiced_probs[index])
+                    if prob >= threshold_ratio:
+                        pitch = candidate
+                        active_confidence = max(active_confidence, prob)
+                else:
+                    pitch = candidate
+        has_note = pitch is not None
+        if has_note and pitch != active_pitch:
+            if active_pitch is not None:
+                duration = max(min_duration, _quantize(timestamp - active_start, step))
+                if duration >= min_duration:
+                    notes.append(NoteEvent(_quantize(active_start, step) + offset, duration, active_pitch, 88, min(1.0, active_confidence), instrument))
+            active_pitch = pitch
+            active_start = float(timestamp)
+            active_confidence = float(voiced_probs[index]) if voiced_probs is not None else 0.75
+        elif has_note and pitch == active_pitch:
+            active_confidence = max(active_confidence, float(voiced_probs[index]) if voiced_probs is not None else 0.75)
+        elif not has_note and active_pitch is not None:
+            duration = max(min_duration, _quantize(timestamp - active_start, step))
+            if duration >= min_duration:
+                notes.append(NoteEvent(_quantize(active_start, step) + offset, duration, active_pitch, 88, min(1.0, active_confidence), instrument))
+            active_pitch = None
 
-    project.tracks = [
-        Track(track.name, track.program, track.color, [note for note in track.notes if note.start < start_time or note.start >= start_time + measure_length], track.muted, track.solo)
-        if track.name == melody_track.name else track
-        for track in project.tracks
-    ]
-    melody_track.notes = [note for note in melody_track.notes if note.start < start_time or note.start >= start_time + measure_length]
-    melody_track.notes.extend(melody)
-    project.update_measure_metadata()
+    if active_pitch is not None:
+        duration = max(min_duration, _quantize(float(times[-1] + step - active_start), step))
+        notes.append(NoteEvent(_quantize(active_start, step) + offset, duration, active_pitch, 88, min(1.0, active_confidence), instrument))
+    return notes
 
 
 def analyze_audio(path: Path, progress_callback=None) -> SongProject:
-    """Analyze audio into an editable, single-pass transcription baseline."""
+    """Analyze audio into an editable, multi-track transcription project."""
     import librosa
 
     def report(percent: int, message: str) -> None:
@@ -220,22 +320,25 @@ def analyze_audio(path: Path, progress_callback=None) -> SongProject:
             progress_callback(percent, message)
 
     report(8, "正在读取音频…")
-    audio, sample_rate = librosa.load(path, sr=22050, mono=True)
+    audio, sample_rate = _load_audio(path)
     duration = len(audio) / sample_rate
-    report(22, "正在识别 BPM 与节拍…")
+    report(20, "正在识别 BPM 与节拍…")
     tempo, beat_frames = librosa.beat.beat_track(y=audio, sr=sample_rate, start_bpm=120.0, tightness=100)
     bpm = float(np.asarray(tempo).item()) if np.size(tempo) else 120.0
     bpm = bpm if math.isfinite(bpm) and bpm > 30 else 120.0
-    report(38, "正在估算调性与和弦…")
-    harmonic, percussive = librosa.effects.hpss(audio)
-    chroma = librosa.feature.chroma_cqt(y=harmonic, sr=sample_rate)
+    report(34, "正在清洗音频…")
+    audio = _spectral_denoise(audio, sample_rate)
+    report(48, "正在分轨音频…")
+    melody_audio, bass_audio, drums_audio, harmony_audio = _separate_stems(audio, sample_rate)
+    report(58, "正在提取调性与和弦…")
+    chroma = librosa.feature.chroma_cqt(y=melody_audio, sr=sample_rate)
     key = _estimate_key(chroma)
-    report(54, "正在分轨提取主旋律与贝斯…")
-    melody = _extract_pitched_line(harmonic, sample_rate, bpm, "主旋律", "C3", "C7", threshold_ratio=0.16)
-    bass = _extract_pitched_line(harmonic, sample_rate, bpm, "贝斯", "E1", "C4", threshold_ratio=0.12, prefer_low=True)
+    report(68, "正在识别主旋律与贝斯…")
+    melody = _extract_notes_from_f0(melody_audio, sample_rate, bpm, "主旋律", "C3", "C7", threshold_ratio=0.1)
+    bass = _extract_notes_from_f0(bass_audio, sample_rate, bpm, "贝斯", "E1", "C4", threshold_ratio=0.08, min_duration=0.12, prefer_low=True)
+    report(78, "正在生成和声与鼓点…")
     harmony, chords = _generate_harmony(duration, bpm, key)
-    report(72, "正在提取鼓点…")
-    drums = _extract_drums(percussive, sample_rate, bpm)
+    drums = _extract_drums(drums_audio, sample_rate, bpm)
     report(88, "正在处理结果与置信度…")
     project = SongProject(title=path.stem, audio_path=path, bpm=round(bpm, 1), key=key, duration=duration)
     project.tracks = [
@@ -248,3 +351,66 @@ def analyze_audio(path: Path, progress_callback=None) -> SongProject:
     project.update_measure_metadata()
     report(100, "分析完成")
     return project
+
+
+def regenerate_measure(project: SongProject, measure_idx: int, beats_per_measure: int = 4) -> None:
+    """Re-generate a single measure from the original audio source if available."""
+    if project.audio_path is None or not project.audio_path.exists():
+        return
+
+    audio, sample_rate = _load_audio(project.audio_path)
+    measure_length = beats_per_measure * 60.0 / project.bpm
+    start = measure_idx * measure_length
+    if start >= len(audio) / sample_rate:
+        return
+
+    segment = _slice_audio_segment(audio, sample_rate, start, measure_length)
+    melody_audio, bass_audio, drums_audio, harmony_audio = _separate_stems(segment, sample_rate)
+    melody = _extract_notes_from_f0(
+        melody_audio,
+        sample_rate,
+        project.bpm,
+        "主旋律",
+        "C3",
+        "C7",
+        threshold_ratio=0.1,
+        offset=start,
+    )
+    bass = _extract_notes_from_f0(
+        bass_audio,
+        sample_rate,
+        project.bpm,
+        "贝斯",
+        "E1",
+        "C4",
+        threshold_ratio=0.08,
+        min_duration=0.12,
+        prefer_low=True,
+        offset=start,
+    )
+    drums = _extract_drums(drums_audio, sample_rate, project.bpm)
+    for note in drums:
+        note.start = min(note.start + start, project.duration)
+
+    measure_start = start
+    measure_end = start + measure_length
+    for track in project.tracks:
+        track.notes = [
+            note for note in track.notes
+            if note.end <= measure_start or note.start >= measure_end
+        ]
+
+    for track in project.tracks:
+        if track.name == "主旋律":
+            track.notes.extend(melody)
+        elif track.name == "贝斯":
+            track.notes.extend(bass)
+        elif track.name == "鼓组":
+            track.notes.extend(drums)
+        elif track.name == "和声":
+            harmony, _ = _generate_harmony(measure_length, project.bpm, project.key)
+            for note in harmony:
+                note.start = min(note.start + start, project.duration)
+            track.notes.extend(harmony)
+
+    project.update_measure_metadata()

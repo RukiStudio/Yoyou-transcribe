@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QPointF
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QGraphicsRectItem, QGraphicsScene, QGraphicsView
 
@@ -20,6 +20,52 @@ class PianoNoteItem(QGraphicsRectItem):
         self.setBrush(QColor(color))
         self.setPen(QPen(QColor("#FFFFFF"), 1))
         self.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsSelectable, True)
+        self.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
+        self.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsFocusable, True)
+        self.setAcceptHoverEvents(True)
+        self._is_resizing = False
+        self._resize_start_x = 0.0
+        self._initial_width = width
+
+    def itemChange(self, change, value):
+        if change == QGraphicsRectItem.GraphicsItemChange.ItemPositionChange and self.scene():
+            new_pos = value.toPointF() if isinstance(value, QPointF) else QPointF(value)
+            x = max(0.0, new_pos.x())
+            y = max(0.0, new_pos.y())
+            return QPointF(x, y)
+        return super().itemChange(change, value)
+
+    def hoverMoveEvent(self, event):
+        if event.pos().x() >= self.rect().width() - 10:
+            self.setCursor(Qt.SizeHorCursor)
+        else:
+            self.setCursor(Qt.OpenHandCursor)
+        super().hoverMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and event.pos().x() >= self.rect().width() - 10:
+            self._is_resizing = True
+            self._resize_start_x = event.pos().x()
+            self._initial_width = self.rect().width()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._is_resizing:
+            delta = event.pos().x() - self._resize_start_x
+            new_width = max(8.0, self._initial_width + delta)
+            self.setRect(0, 0, new_width, self.rect().height())
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._is_resizing:
+            self._is_resizing = False
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class PianoRoll(QGraphicsView):
@@ -91,6 +137,7 @@ class PianoRoll(QGraphicsView):
                     max(8, note.duration * self.pixels_per_second),
                     self.row_height - 2,
                 )
+                item.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsMovable, self._edit_mode == "select")
                 self.scene.addItem(item)
         self.centerOn(0, self._pitch_y(60))
 
@@ -120,6 +167,31 @@ class PianoRoll(QGraphicsView):
         track.notes.append(note)
         self.set_project(self.project)
         self.note_added.emit(note)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if self.project is None:
+            return
+
+        step = 60 / self.project.bpm / 4
+        changed = False
+        for item in self.scene.selectedItems():
+            if not isinstance(item, PianoNoteItem):
+                continue
+            new_start = max(0.0, item.pos().x() / self.pixels_per_second)
+            snapped_start = round(new_start / step) * step
+            pitch = max(
+                self.lowest_pitch,
+                min(self.highest_pitch, self.highest_pitch - round(item.pos().y() / self.row_height)),
+            )
+            item.note.start = snapped_start
+            item.note.pitch = pitch
+            item.note.duration = max(0.05, item.rect().width() / self.pixels_per_second)
+            item.setPos(snapped_start * self.pixels_per_second, self._pitch_y(pitch) + 1)
+            changed = True
+
+        if changed:
+            self.set_project(self.project)
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self.project:
