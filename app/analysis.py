@@ -122,10 +122,14 @@ def _extract_drums(y: np.ndarray, sr: int, bpm: float) -> list[NoteEvent]:
     onset_env = librosa.onset.onset_strength(y=y, sr=sr)
     onset_times = librosa.onset.onset_detect(onset_envelope=onset_env, sr=sr, units="time", backtrack=False)
     step = 60.0 / bpm / 4
-    max_strength = float(np.max(onset_env)) if np.any(onset_env) else 1.0
+    strength_profile = librosa.util.normalize(onset_env, norm=2) if onset_env.size else np.array([])
     drums: list[NoteEvent] = []
     for time in onset_times:
-        confidence = min(1.0, float(librosa.util.normalize(onset_env, norm=2))[int(round(time * sr / 512))] if onset_env.size else 0.75)
+        onset_frame = int(round(time * sr / 512))
+        if 0 <= onset_frame < len(strength_profile):
+            confidence = min(1.0, float(strength_profile[onset_frame]))
+        else:
+            confidence = 0.75
         is_downbeat = round(time / step) % 4 == 0
         note = 36 if is_downbeat else 42 if time % (step * 2) < step else 38
         drums.append(NoteEvent(_quantize(float(time), step), step * 0.8, note, 96, confidence, "鼓组"))
