@@ -15,7 +15,7 @@ class NoteEvent:
     pitch: int
     velocity: int = 88
     confidence: float = 0.75
-    instrument: str = "涓绘棆寰?
+    instrument: str = "琵琶"
 
     @property
     def end(self) -> float:
@@ -39,7 +39,7 @@ class Track:
 class SongProject:
     """All editable analysis results for one imported song."""
 
-    title: str = "鏈懡鍚嶅伐绋?
+    title: str = "未命名工程"
     audio_path: Path | None = None
     bpm: float = 120.0
     key: str = "C Major"
