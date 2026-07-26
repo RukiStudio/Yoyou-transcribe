@@ -35,7 +35,7 @@ def export_midi(project: SongProject, destination: Path, notes: list[NoteEvent] 
         if channel != 9:
             midi_track.append(Message("program_change", program=source_track.program, channel=channel, time=0))
         events = []
-        for note in track_notes:
+        for note in sorted(track_notes, key=lambda note: (note.start, note.end, note.pitch)):
             events.extend([(note.start, True, note), (note.end, False, note)])
         previous_tick = 0
         for time_seconds, is_start, note in sorted(events, key=lambda event: (event[0], not event[1])):

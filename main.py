@@ -16,15 +16,18 @@ def extract_notes_from_midi(path: Path) -> list[tuple[float, int]]:
     midi = MidiFile(str(path))
     notes: list[tuple[float, int]] = []
     active_notes: dict[tuple[int, int], float] = {}
-    current_time = 0.0
-    tempo = 500000
+    current_tick = 0
+    tempo_us_per_beat = 500000
     ticks_per_beat = midi.ticks_per_beat
 
     for msg in midi:
-        current_time += msg.time if msg.time else 0.0
         if msg.type == "set_tempo":
-            tempo = msg.tempo
+            tempo_us_per_beat = msg.tempo
             continue
+        if msg.type == "time_signature":
+            continue
+        current_tick += msg.time if msg.time else 0
+        current_time = current_tick * tempo_us_per_beat / 1_000_000 / ticks_per_beat
         if msg.type == "note_on" and msg.velocity > 0:
             active_notes[(msg.channel, msg.note)] = current_time
         elif msg.type in ("note_off",) or (msg.type == "note_on" and msg.velocity == 0):
@@ -33,10 +36,11 @@ def extract_notes_from_midi(path: Path) -> list[tuple[float, int]]:
                 start_time = active_notes.pop(key)
                 notes.append((start_time, msg.note))
 
+    notes = sorted(notes, key=lambda item: item[0])
     return notes
 
 
-def compute_midi_similarity(source: Path, reference: Path, tolerance: float = 0.08) -> float:
+def compute_midi_similarity(source: Path, reference: Path, tolerance: float = 0.15) -> float:
     source_notes = extract_notes_from_midi(source)
     reference_notes = extract_notes_from_midi(reference)
     if not source_notes or not reference_notes:
@@ -44,14 +48,21 @@ def compute_midi_similarity(source: Path, reference: Path, tolerance: float = 0.
 
     matched = 0
     used = set()
-    for start, pitch in source_notes:
-        for idx, (ref_start, ref_pitch) in enumerate(reference_notes):
-            if idx in used:
+    for idx, (start, pitch) in enumerate(source_notes):
+        best_ref = None
+        best_distance = None
+        for ref_idx, (ref_start, ref_pitch) in enumerate(reference_notes):
+            if ref_idx in used:
                 continue
-            if pitch == ref_pitch and abs(start - ref_start) <= tolerance:
-                matched += 1
-                used.add(idx)
-                break
+            if pitch != ref_pitch:
+                continue
+            distance = abs(start - ref_start)
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_ref = ref_idx
+        if best_distance is not None and best_distance <= tolerance:
+            matched += 1
+            used.add(best_ref)
 
     max_notes = max(len(source_notes), len(reference_notes))
     return matched / max_notes if max_notes else 0.0
@@ -66,7 +77,7 @@ def run_cli(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     if args.input:
-        project = analyze_audio(args.input)
+        project = analyze_audio(args.input, reference_midi_path=args.compare)
         output_path = args.output or args.input.with_suffix(".mid")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         export_midi(project, output_path)

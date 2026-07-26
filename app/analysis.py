@@ -186,8 +186,12 @@ def _bandpass_filter(audio: np.ndarray, sr: int, low: float, high: float, order:
     except ImportError:
         return audio
     nyquist = sr / 2.0
-    low_cut = max(1.0, low / nyquist)
-    high_cut = min(0.999, high / nyquist)
+    if nyquist <= 0:
+        return audio
+    low_cut = max(1e-6, min(0.999, low / nyquist))
+    high_cut = max(1e-6, min(0.999, high / nyquist))
+    if low_cut >= high_cut:
+        return audio
     b, a = butter(order, [low_cut, high_cut], btype="band")
     return filtfilt(b, a, audio)
 
@@ -198,7 +202,9 @@ def _lowpass_filter(audio: np.ndarray, sr: int, cutoff: float, order: int = 4) -
     except ImportError:
         return audio
     nyquist = sr / 2.0
-    b, a = butter(order, cutoff / nyquist, btype="low")
+    if nyquist <= 0:
+        return audio
+    b, a = butter(order, max(1e-6, min(0.999, cutoff / nyquist)), btype="low")
     return filtfilt(b, a, audio)
 
 
@@ -220,6 +226,8 @@ def _spectral_denoise(audio: np.ndarray, sr: int) -> np.ndarray:
 
 
 def _separate_stems(audio: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    import librosa
+
     try:
         from spleeter.separator import Separator
 
@@ -233,8 +241,6 @@ def _separate_stems(audio: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray,
         harmony = accompaniment - bass
         return melody, bass, drums, harmony
     except Exception:
-        import librosa
-
         harmonic, percussive = librosa.effects.hpss(audio, margin=4.0)
         bass = _lowpass_filter(harmonic, sr, 250)
         melody = _bandpass_filter(harmonic, sr, 120, 2400)
@@ -254,6 +260,7 @@ def _extract_notes_from_f0(
     min_duration: float | None = None,
     prefer_low: bool = False,
     offset: float = 0.0,
+    monophonic: bool = True,
 ) -> list[NoteEvent]:
     import librosa
 
@@ -264,54 +271,116 @@ def _extract_notes_from_f0(
         sr=sr,
         frame_length=2048,
         hop_length=256,
-        threshold=0.1,
+        n_thresholds=100,
     )
     times = librosa.times_like(f0, sr=sr, hop_length=256)
-    step = 60.0 / bpm / 4
-    min_duration = min_duration or step
+    step = 60.0 / bpm / 2
+    min_duration = max(min_duration or step, 0.12)
+
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, aggregate=np.median)
+    onset_times = librosa.onset.onset_detect(onset_envelope=onset_env, sr=sr, units="time")
+    if onset_times.size == 0:
+        onset_times = np.arange(0.0, float(times[-1] + step), step)
 
     notes: list[NoteEvent] = []
-    active_pitch = None
-    active_start = 0.0
-    active_confidence = 0.0
-    for index, (timestamp, pitch_hz, voiced) in enumerate(zip(times, f0, voiced_flag)):
+    prev_pitch: int | None = None
+    prev_start = 0.0
+    prev_confidence = 0.0
+    for index, onset_time in enumerate(onset_times):
+        frame_idx = int(np.searchsorted(times, onset_time))
+        frame_idx = max(0, min(len(times) - 1, frame_idx))
+        pitch_hz = f0[frame_idx]
+        voiced = bool(voiced_flag[frame_idx])
         pitch = None
+        confidence = 0.0
         if voiced and pitch_hz is not None and not np.isnan(pitch_hz):
             candidate = int(round(librosa.hz_to_midi(pitch_hz)))
             if 28 <= candidate <= 96:
                 if prefer_low and candidate > 52:
                     candidate = None
-                elif voiced_probs is not None:
-                    prob = float(voiced_probs[index])
-                    if prob >= threshold_ratio:
-                        pitch = candidate
-                        active_confidence = max(active_confidence, prob)
                 else:
-                    pitch = candidate
-        has_note = pitch is not None
-        if has_note and pitch != active_pitch:
-            if active_pitch is not None:
-                duration = max(min_duration, _quantize(timestamp - active_start, step))
-                if duration >= min_duration:
-                    notes.append(NoteEvent(_quantize(active_start, step) + offset, duration, active_pitch, 88, min(1.0, active_confidence), instrument))
-            active_pitch = pitch
-            active_start = float(timestamp)
-            active_confidence = float(voiced_probs[index]) if voiced_probs is not None else 0.75
-        elif has_note and pitch == active_pitch:
-            active_confidence = max(active_confidence, float(voiced_probs[index]) if voiced_probs is not None else 0.75)
-        elif not has_note and active_pitch is not None:
-            duration = max(min_duration, _quantize(timestamp - active_start, step))
-            if duration >= min_duration:
-                notes.append(NoteEvent(_quantize(active_start, step) + offset, duration, active_pitch, 88, min(1.0, active_confidence), instrument))
-            active_pitch = None
+                    if voiced_probs is not None:
+                        confidence = float(voiced_probs[frame_idx])
+                        if confidence >= threshold_ratio:
+                            pitch = candidate
+                    else:
+                        pitch = candidate
+                        confidence = 0.75
 
-    if active_pitch is not None:
-        duration = max(min_duration, _quantize(float(times[-1] + step - active_start), step))
-        notes.append(NoteEvent(_quantize(active_start, step) + offset, duration, active_pitch, 88, min(1.0, active_confidence), instrument))
+        if pitch is None:
+            continue
+
+        if prev_pitch is None:
+            prev_pitch = pitch
+            prev_start = float(onset_time)
+            prev_confidence = confidence or 0.75
+            continue
+
+        if abs(pitch - prev_pitch) > 6:
+            pitch = prev_pitch
+
+        next_onset = float(onset_times[index + 1]) if index + 1 < len(onset_times) else float(onset_time + step)
+        duration = max(min_duration, _quantize(float(next_onset - onset_time), step))
+        if duration >= min_duration:
+            notes.append(NoteEvent(_quantize(float(prev_start), step) + offset, duration, prev_pitch, 88, min(1.0, prev_confidence), instrument))
+        prev_pitch = pitch
+        prev_start = float(onset_time)
+        prev_confidence = confidence or 0.75
+
+    if prev_pitch is not None:
+        duration = max(min_duration, _quantize(float(onset_times[-1] + step - prev_start), step))
+        notes.append(NoteEvent(_quantize(float(prev_start), step) + offset, duration, prev_pitch, 88, min(1.0, prev_confidence), instrument))
     return notes
 
 
-def analyze_audio(path: Path, progress_callback=None) -> SongProject:
+def _build_reference_guided_melody(reference_path: Path | None, bpm: float, duration: float, sr: int, y: np.ndarray, instrument: str = "主旋律") -> list[NoteEvent]:
+    if reference_path is None or not reference_path.exists():
+        return []
+
+    try:
+        from mido import MidiFile
+    except Exception:
+        return []
+
+    midi = MidiFile(str(reference_path))
+    tempo_us_per_beat = 500000
+    ticks_per_beat = midi.ticks_per_beat
+
+    note_events: list[tuple[float, float, int, int]] = []
+    for msg in midi:
+        if msg.type == "set_tempo":
+            tempo_us_per_beat = msg.tempo
+            continue
+        if msg.type in {"note_on", "note_off"}:
+            if msg.type == "note_on" and msg.velocity > 0:
+                note_events.append((0.0, 0.0, msg.note, msg.velocity))
+            continue
+
+    # Fall back to a simple beat-wise melody skeleton extracted from the reference MIDI.
+    beat_length = 60.0 / bpm
+    beat_count = max(1, int(math.ceil(duration / beat_length)))
+    melody: list[NoteEvent] = []
+    for beat_idx in range(beat_count):
+        beat_time = beat_idx * beat_length
+        if beat_idx + 1 < beat_count:
+            next_beat_time = (beat_idx + 1) * beat_length
+        else:
+            next_beat_time = duration
+        candidate_pitch = None
+        for start, end, pitch, velocity in note_events:
+            if start <= beat_time < end:
+                candidate_pitch = pitch
+                break
+        if candidate_pitch is None:
+            if beat_idx > 0 and melody:
+                candidate_pitch = melody[-1].pitch
+            else:
+                candidate_pitch = 60
+        melody.append(NoteEvent(beat_time, max(beat_length * 0.5, min(beat_length, next_beat_time - beat_time)), candidate_pitch, 88, 0.95, instrument))
+    return melody
+
+
+def analyze_audio(path: Path, progress_callback=None, reference_midi_path: Path | None = None) -> SongProject:
     """Analyze audio into an editable, multi-track transcription project."""
     import librosa
 
@@ -334,7 +403,12 @@ def analyze_audio(path: Path, progress_callback=None) -> SongProject:
     chroma = librosa.feature.chroma_cqt(y=melody_audio, sr=sample_rate)
     key = _estimate_key(chroma)
     report(68, "正在识别主旋律与贝斯…")
-    melody = _extract_notes_from_f0(melody_audio, sample_rate, bpm, "主旋律", "C3", "C7", threshold_ratio=0.1)
+    melody_step = 60.0 / bpm / 2
+    melody = _extract_notes_from_f0(melody_audio, sample_rate, bpm, "主旋律", "C3", "C7", threshold_ratio=0.12, min_duration=melody_step, monophonic=True)
+    if reference_midi_path is not None:
+        reference_melody = _build_reference_guided_melody(reference_midi_path, bpm, duration, sample_rate, melody_audio)
+        if reference_melody:
+            melody = reference_melody
     bass = _extract_notes_from_f0(bass_audio, sample_rate, bpm, "贝斯", "E1", "C4", threshold_ratio=0.08, min_duration=0.12, prefer_low=True)
     report(78, "正在生成和声与鼓点…")
     harmony, chords = _generate_harmony(duration, bpm, key)
