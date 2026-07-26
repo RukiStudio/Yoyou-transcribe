@@ -283,12 +283,8 @@ def _extract_notes_from_f0(
         onset_times = np.arange(0.0, float(times[-1] + step), step)
 
     notes: list[NoteEvent] = []
-    prev_pitch: int | None = None
-    prev_start = 0.0
-    prev_confidence = 0.0
-    for index, onset_time in enumerate(onset_times):
-        frame_idx = int(np.searchsorted(times, onset_time))
-        frame_idx = max(0, min(len(times) - 1, frame_idx))
+    frame_candidates: list[tuple[float, int, float]] = []
+    for frame_idx in range(len(times)):
         pitch_hz = f0[frame_idx]
         voiced = bool(voiced_flag[frame_idx])
         pitch = None
@@ -306,30 +302,36 @@ def _extract_notes_from_f0(
                     else:
                         pitch = candidate
                         confidence = 0.75
+        if pitch is not None:
+            frame_candidates.append((float(times[frame_idx]), pitch, confidence))
 
-        if pitch is None:
+    if not frame_candidates:
+        return []
+
+    beat_grid = np.arange(0.0, max(times[-1], 0.1) + step, step)
+    for beat_idx in range(len(beat_grid) - 1):
+        beat_start = float(beat_grid[beat_idx])
+        beat_end = float(beat_grid[beat_idx + 1])
+        window = [candidate for candidate in frame_candidates if beat_start <= candidate[0] < beat_end]
+        if not window:
+            if notes:
+                prev_pitch = notes[-1].pitch
+                notes.append(NoteEvent(_quantize(beat_start, step) + offset, max(min_duration, beat_end - beat_start), prev_pitch, 88, 0.6, instrument))
             continue
 
-        if prev_pitch is None:
-            prev_pitch = pitch
-            prev_start = float(onset_time)
-            prev_confidence = confidence or 0.75
-            continue
-
-        if abs(pitch - prev_pitch) > 6:
-            pitch = prev_pitch
-
-        next_onset = float(onset_times[index + 1]) if index + 1 < len(onset_times) else float(onset_time + step)
-        duration = max(min_duration, _quantize(float(next_onset - onset_time), step))
-        if duration >= min_duration:
-            notes.append(NoteEvent(_quantize(float(prev_start), step) + offset, duration, prev_pitch, 88, min(1.0, prev_confidence), instrument))
-        prev_pitch = pitch
-        prev_start = float(onset_time)
-        prev_confidence = confidence or 0.75
-
-    if prev_pitch is not None:
-        duration = max(min_duration, _quantize(float(onset_times[-1] + step - prev_start), step))
-        notes.append(NoteEvent(_quantize(float(prev_start), step) + offset, duration, prev_pitch, 88, min(1.0, prev_confidence), instrument))
+        candidate_pitches = [pitch for _, pitch, _ in window]
+        candidate_confidences = [confidence for _, _, confidence in window]
+        if notes:
+            previous_pitch = notes[-1].pitch
+            pairings = []
+            for pitch, confidence in zip(candidate_pitches, candidate_confidences, strict=False):
+                distance = abs(pitch - previous_pitch)
+                pairings.append((distance, -confidence, pitch))
+            best_pitch = min(pairings)[2]
+        else:
+            best_pitch = max(set(candidate_pitches), key=lambda pitch: candidate_pitches.count(pitch))
+        best_confidence = max(candidate_confidences) if candidate_confidences else 0.0
+        notes.append(NoteEvent(_quantize(beat_start, step) + offset, max(min_duration, beat_end - beat_start), best_pitch, 88, min(1.0, best_confidence), instrument))
     return notes
 
 
@@ -345,38 +347,70 @@ def _build_reference_guided_melody(reference_path: Path | None, bpm: float, dura
     midi = MidiFile(str(reference_path))
     tempo_us_per_beat = 500000
     ticks_per_beat = midi.ticks_per_beat
+    active_notes: dict[tuple[int, int], tuple[float, int]] = {}
+    current_tick = 0
+    reference_notes: list[tuple[float, float, int, int]] = []
 
-    note_events: list[tuple[float, float, int, int]] = []
     for msg in midi:
         if msg.type == "set_tempo":
             tempo_us_per_beat = msg.tempo
             continue
-        if msg.type in {"note_on", "note_off"}:
-            if msg.type == "note_on" and msg.velocity > 0:
-                note_events.append((0.0, 0.0, msg.note, msg.velocity))
+        if msg.type == "time_signature":
+            continue
+        current_tick += msg.time if msg.time else 0
+        current_time = current_tick * tempo_us_per_beat / 1_000_000 / ticks_per_beat
+        if msg.type == "note_on" and msg.velocity > 0:
+            active_notes[(msg.channel, msg.note)] = (current_time, msg.velocity)
+        elif msg.type in {"note_off"} or (msg.type == "note_on" and msg.velocity == 0):
+            key = (msg.channel, msg.note)
+            if key in active_notes:
+                start_time, velocity = active_notes.pop(key)
+                if current_time > start_time + 0.01:
+                    reference_notes.append((start_time, current_time, msg.note, velocity))
+
+    if not reference_notes:
+        return []
+
+    reference_notes.sort(key=lambda item: item[0])
+    reference_end = max(start + (end - start) for start, end, _, _ in reference_notes)
+    if reference_end <= 0:
+        return []
+
+    step = max(0.12, 60.0 / bpm / 2)
+    scale = duration / max(reference_end, duration)
+    melody: list[NoteEvent] = []
+    last_pitch: int | None = None
+
+    for segment_start in np.arange(0.0, duration + step, step):
+        segment_end = min(duration, segment_start + step)
+        candidates = [
+            (start_time * scale, end_time * scale, pitch, velocity)
+            for start_time, end_time, pitch, velocity in reference_notes
+            if start_time * scale < segment_end and end_time * scale > segment_start
+        ]
+        if not candidates:
+            if melody and last_pitch is not None:
+                melody.append(NoteEvent(segment_start, max(0.12, segment_end - segment_start), last_pitch, 88, 0.75, instrument))
             continue
 
-    # Fall back to a simple beat-wise melody skeleton extracted from the reference MIDI.
-    beat_length = 60.0 / bpm
-    beat_count = max(1, int(math.ceil(duration / beat_length)))
-    melody: list[NoteEvent] = []
-    for beat_idx in range(beat_count):
-        beat_time = beat_idx * beat_length
-        if beat_idx + 1 < beat_count:
-            next_beat_time = (beat_idx + 1) * beat_length
-        else:
-            next_beat_time = duration
-        candidate_pitch = None
-        for start, end, pitch, velocity in note_events:
-            if start <= beat_time < end:
-                candidate_pitch = pitch
-                break
-        if candidate_pitch is None:
-            if beat_idx > 0 and melody:
-                candidate_pitch = melody[-1].pitch
-            else:
-                candidate_pitch = 60
-        melody.append(NoteEvent(beat_time, max(beat_length * 0.5, min(beat_length, next_beat_time - beat_time)), candidate_pitch, 88, 0.95, instrument))
+        best_note = max(
+            candidates,
+            key=lambda item: (
+                item[3],
+                127 - abs(item[2] - 60),
+                -abs(item[2] - (last_pitch if last_pitch is not None else item[2])),
+                -(item[1] - item[0]),
+            ),
+        )
+        start_time, end_time, pitch, velocity = best_note
+        if start_time >= duration:
+            continue
+        scaled_duration = max(0.12, min(segment_end - start_time, max(0.12, end_time - start_time)))
+        if scaled_duration <= 0:
+            continue
+        confidence = min(1.0, 0.85 + (velocity / 127.0) * 0.1)
+        melody.append(NoteEvent(max(0.0, start_time), scaled_duration, pitch, 88, confidence, instrument))
+        last_pitch = pitch
     return melody
 
 
@@ -404,11 +438,23 @@ def analyze_audio(path: Path, progress_callback=None, reference_midi_path: Path 
     key = _estimate_key(chroma)
     report(68, "正在识别主旋律与贝斯…")
     melody_step = 60.0 / bpm / 2
-    melody = _extract_notes_from_f0(melody_audio, sample_rate, bpm, "主旋律", "C3", "C7", threshold_ratio=0.12, min_duration=melody_step, monophonic=True)
+    audio_melody = _extract_notes_from_f0(melody_audio, sample_rate, bpm, "主旋律", "C3", "C7", threshold_ratio=0.12, min_duration=melody_step, monophonic=True)
+    melody = audio_melody
     if reference_midi_path is not None:
         reference_melody = _build_reference_guided_melody(reference_midi_path, bpm, duration, sample_rate, melody_audio)
         if reference_melody:
-            melody = reference_melody
+            fused_melody: list[NoteEvent] = []
+            for reference_note in reference_melody:
+                if not audio_melody:
+                    fused_melody.append(reference_note)
+                    continue
+                nearest = min(audio_melody, key=lambda note: abs(note.start - reference_note.start))
+                if abs(nearest.start - reference_note.start) <= melody_step:
+                    pitch = nearest.pitch if nearest.confidence >= 0.7 else reference_note.pitch
+                    fused_melody.append(NoteEvent(reference_note.start, reference_note.duration, pitch, 88, 0.9, "主旋律"))
+                else:
+                    fused_melody.append(reference_note)
+            melody = fused_melody if fused_melody else reference_melody
     bass = _extract_notes_from_f0(bass_audio, sample_rate, bpm, "贝斯", "E1", "C4", threshold_ratio=0.08, min_duration=0.12, prefer_low=True)
     report(78, "正在生成和声与鼓点…")
     harmony, chords = _generate_harmony(duration, bpm, key)

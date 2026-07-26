@@ -12,9 +12,9 @@ from app.midi_service import export_midi
 from app.ui.main_window import MainWindow
 
 
-def extract_notes_from_midi(path: Path) -> list[tuple[float, int]]:
+def extract_notes_from_midi(path: Path) -> list[tuple[float, float, int]]:
     midi = MidiFile(str(path))
-    notes: list[tuple[float, int]] = []
+    notes: list[tuple[float, float, int]] = []
     active_notes: dict[tuple[int, int], float] = {}
     current_tick = 0
     tempo_us_per_beat = 500000
@@ -34,7 +34,7 @@ def extract_notes_from_midi(path: Path) -> list[tuple[float, int]]:
             key = (msg.channel, msg.note)
             if key in active_notes:
                 start_time = active_notes.pop(key)
-                notes.append((start_time, msg.note))
+                notes.append((start_time, current_time, msg.note))
 
     notes = sorted(notes, key=lambda item: item[0])
     return notes
@@ -46,26 +46,29 @@ def compute_midi_similarity(source: Path, reference: Path, tolerance: float = 0.
     if not source_notes or not reference_notes:
         return 0.0
 
-    matched = 0
-    used = set()
-    for idx, (start, pitch) in enumerate(source_notes):
-        best_ref = None
-        best_distance = None
-        for ref_idx, (ref_start, ref_pitch) in enumerate(reference_notes):
-            if ref_idx in used:
-                continue
-            if pitch != ref_pitch:
-                continue
-            distance = abs(start - ref_start)
-            if best_distance is None or distance < best_distance:
-                best_distance = distance
-                best_ref = ref_idx
-        if best_distance is not None and best_distance <= tolerance:
-            matched += 1
-            used.add(best_ref)
+    source_pitch_seq = [pitch for _, _, pitch in source_notes]
+    reference_pitch_seq = [pitch for _, _, pitch in reference_notes]
+    source_duration_seq = [max(0.01, end - start) for start, end, _ in source_notes]
+    reference_duration_seq = [max(0.01, end - start) for start, end, _ in reference_notes]
 
+    scored = 0.0
     max_notes = max(len(source_notes), len(reference_notes))
-    return matched / max_notes if max_notes else 0.0
+    min_len = min(len(source_notes), len(reference_notes))
+    for idx in range(min_len):
+        source_pitch = source_pitch_seq[idx]
+        ref_pitch = reference_pitch_seq[idx]
+        source_duration = source_duration_seq[idx]
+        ref_duration = reference_duration_seq[idx]
+        if source_pitch == ref_pitch:
+            onset_diff = abs(source_notes[idx][0] - reference_notes[idx][0])
+            duration_diff = abs(source_duration - ref_duration)
+            onset_score = max(0.0, 1.0 - (onset_diff / max(0.05, float(tolerance))))
+            duration_score = max(0.0, 1.0 - (duration_diff / max(0.05, float(tolerance))))
+            scored += 0.7 * onset_score + 0.3 * duration_score
+        else:
+            scored += 0.0
+
+    return scored / max_notes if max_notes else 0.0
 
 
 def run_cli(argv: list[str]) -> int:

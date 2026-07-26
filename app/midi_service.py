@@ -34,17 +34,30 @@ def export_midi(project: SongProject, destination: Path, notes: list[NoteEvent] 
         channel = 9 if source_track.name == "鼓组" else min(track_index, 8)
         if channel != 9:
             midi_track.append(Message("program_change", program=source_track.program, channel=channel, time=0))
-        events = []
-        for note in sorted(track_notes, key=lambda note: (note.start, note.end, note.pitch)):
-            events.extend([(note.start, True, note), (note.end, False, note)])
+
+        sorted_notes = sorted(track_notes, key=lambda note: (note.start, note.end, note.pitch))
+        active_notes: dict[int, tuple[float, NoteEvent]] = {}
         previous_tick = 0
-        for time_seconds, is_start, note in sorted(events, key=lambda event: (event[0], not event[1])):
-            absolute_tick = round(time_seconds * project.bpm / 60 * midi.ticks_per_beat)
+        for note in sorted_notes:
+            absolute_tick = round(note.start * project.bpm / 60 * midi.ticks_per_beat)
             delta = max(0, absolute_tick - previous_tick)
-            message_type = "note_on" if is_start else "note_off"
-            velocity = note.velocity if is_start else 0
-            midi_track.append(Message(message_type, note=note.pitch, velocity=velocity, channel=channel, time=delta))
+            if delta > 0:
+                for pitch, active_note in list(active_notes.items()):
+                    end_tick = round(active_note[0] * project.bpm / 60 * midi.ticks_per_beat)
+                    if end_tick <= absolute_tick:
+                        midi_track.append(Message("note_off", note=pitch, velocity=0, channel=channel, time=max(0, end_tick - previous_tick)))
+                        previous_tick = end_tick
+                        active_notes.pop(pitch, None)
+            midi_track.append(Message("note_on", note=note.pitch, velocity=note.velocity, channel=channel, time=delta))
             previous_tick = absolute_tick
+            active_notes[note.pitch] = (note.end, note)
+
+        for pitch, (end_time, note) in list(active_notes.items()):
+            absolute_tick = round(end_time * project.bpm / 60 * midi.ticks_per_beat)
+            delta = max(0, absolute_tick - previous_tick)
+            midi_track.append(Message("note_off", note=pitch, velocity=0, channel=channel, time=delta))
+            previous_tick = absolute_tick
+
         midi.tracks.append(midi_track)
     midi.save(destination)
 
